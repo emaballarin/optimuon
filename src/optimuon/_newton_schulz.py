@@ -14,6 +14,7 @@ from torch import Tensor
 
 __all__ = [
     "NS_COEFFICIENTS_DEFAULT",
+    "NS_DTYPE_DEFAULT",
     "NS_EPS_DEFAULT",
     "NS_STEPS_DEFAULT",
     "newton_schulz",
@@ -24,6 +25,7 @@ __all__ = [
 NS_COEFFICIENTS_DEFAULT: tuple[float, float, float] = (3.4445, -4.7750, 2.0315)
 NS_STEPS_DEFAULT: int = 5
 NS_EPS_DEFAULT: float = 1e-7
+NS_DTYPE_DEFAULT: torch.dtype | None = torch.bfloat16
 
 
 def newton_schulz(
@@ -31,6 +33,7 @@ def newton_schulz(
     ns_steps: int = NS_STEPS_DEFAULT,
     ns_coefficients: tuple[float, float, float] = NS_COEFFICIENTS_DEFAULT,
     eps: float = NS_EPS_DEFAULT,
+    ns_dtype: torch.dtype | None = NS_DTYPE_DEFAULT,
 ) -> Tensor:
     """Orthogonalize a single matrix via Newton-Schulz iteration.
 
@@ -42,9 +45,10 @@ def newton_schulz(
         ns_steps: Number of NS iterations.
         ns_coefficients: Quintic polynomial coefficients (a, b, c).
         eps: Stability constant for Frobenius-norm normalization.
+        ns_dtype: Dtype to use for NS iterations. ``None`` preserves input dtype.
 
     Returns:
-        Orthogonalized tensor with the same shape as G.
+        Orthogonalized tensor with the same shape and dtype as G.
     """
     if G.ndim < 2:
         raise ValueError(f"newton_schulz requires ndim >= 2, got {G.ndim}")
@@ -55,6 +59,10 @@ def newton_schulz(
     if transposed:
         G = G.T
 
+    original_dtype = G.dtype
+    if ns_dtype is not None and G.dtype != ns_dtype:
+        G = G.to(ns_dtype)
+
     G = G / (G.norm() + eps)
 
     a, b, c = ns_coefficients
@@ -62,6 +70,9 @@ def newton_schulz(
         A = G @ G.T
         B = b * A + c * A @ A
         G = a * G + B @ G
+
+    if G.dtype != original_dtype:
+        G = G.to(original_dtype)
 
     if transposed:
         G = G.T
@@ -73,6 +84,7 @@ def newton_schulz_batched(
     ns_steps: int = NS_STEPS_DEFAULT,
     ns_coefficients: tuple[float, float, float] = NS_COEFFICIENTS_DEFAULT,
     eps: float = NS_EPS_DEFAULT,
+    ns_dtype: torch.dtype | None = NS_DTYPE_DEFAULT,
 ) -> list[Tensor]:
     """Orthogonalize a batch of matrices, grouped by shape for efficient matmul.
 
@@ -84,6 +96,7 @@ def newton_schulz_batched(
         ns_steps: Number of NS iterations.
         ns_coefficients: Quintic polynomial coefficients (a, b, c).
         eps: Stability constant for normalization.
+        ns_dtype: Dtype to use for NS iterations. ``None`` preserves input dtype.
 
     Returns:
         List of orthogonalized tensors in the same order as input.
@@ -91,7 +104,7 @@ def newton_schulz_batched(
     if not tensors:
         return []
     if len(tensors) == 1:
-        return [newton_schulz(tensors[0], ns_steps, ns_coefficients, eps)]
+        return [newton_schulz(tensors[0], ns_steps, ns_coefficients, eps, ns_dtype)]
 
     # Prepare: flatten to 2D, ensure tall orientation
     records: list[tuple[int, torch.Size, tuple[int, int], bool, Tensor]] = []
@@ -116,6 +129,11 @@ def newton_schulz_batched(
         indices, orig_shapes, transposeds, t2ds = zip(*group, strict=True)
 
         G_batch = torch.stack(list(t2ds))  # (batch, rows, cols)
+
+        original_dtype = G_batch.dtype
+        if ns_dtype is not None and G_batch.dtype != ns_dtype:
+            G_batch = G_batch.to(ns_dtype)
+
         norms = G_batch.flatten(1).norm(dim=1, keepdim=True).unsqueeze(-1) + eps
         G_batch = G_batch / norms
 
@@ -123,6 +141,9 @@ def newton_schulz_batched(
             A = G_batch @ G_batch.transpose(-2, -1)
             B = b * A + c * A @ A
             G_batch = a * G_batch + B @ G_batch
+
+        if G_batch.dtype != original_dtype:
+            G_batch = G_batch.to(original_dtype)
 
         for j, (idx, orig_shape, transp) in enumerate(zip(indices, orig_shapes, transposeds, strict=True)):
             out = G_batch[j]

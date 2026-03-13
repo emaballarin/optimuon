@@ -29,6 +29,7 @@ from ._corrections import clip_update_norm_foreach
 from ._newton_schulz import newton_schulz
 from ._newton_schulz import newton_schulz_batched
 from ._newton_schulz import NS_COEFFICIENTS_DEFAULT
+from ._newton_schulz import NS_DTYPE_DEFAULT
 from ._newton_schulz import NS_EPS_DEFAULT
 from ._newton_schulz import NS_STEPS_DEFAULT
 
@@ -62,6 +63,8 @@ class Muon(Optimizer):
         ns_steps: Newton-Schulz iterations.
         ns_coefficients: Quintic polynomial coefficients ``(a, b, c)``.
         ns_eps: Stability constant for NS normalization.
+        ns_dtype: Dtype for NS iterations. Defaults to ``torch.bfloat16`` for speed.
+            ``None`` preserves input dtype (original behavior).
         adjust_lr: LR scaling mode. ``"original"`` applies KJ aspect-ratio scaling
             ``sqrt(max(1, rows/cols))``. ``"match_rms_adamw"`` applies Moonshot's
             per-parameter scaling ``0.2 * sqrt(max(rows, cols))``.
@@ -89,6 +92,7 @@ class Muon(Optimizer):
         ns_steps: int = NS_STEPS_DEFAULT,
         ns_coefficients: tuple[float, float, float] = NS_COEFFICIENTS_DEFAULT,
         ns_eps: float = NS_EPS_DEFAULT,
+        ns_dtype: torch.dtype | None = NS_DTYPE_DEFAULT,
         adjust_lr: AdjustLrMode = "original",
         momentum_type: MomentumType = "ema",
         foreach: bool = True,
@@ -120,6 +124,8 @@ class Muon(Optimizer):
             raise ValueError(f"Invalid update_clip: {update_clip}")
         if ns_eps <= 0.0:
             raise ValueError(f"Invalid ns_eps: {ns_eps}")
+        if ns_dtype is not None and not isinstance(ns_dtype, torch.dtype):
+            raise TypeError(f"ns_dtype must be a torch.dtype or None, got {type(ns_dtype)}")
 
         if update_clip is not None and distributed:
             warnings.warn(
@@ -135,6 +141,7 @@ class Muon(Optimizer):
             "ns_steps": ns_steps,
             "ns_coefficients": ns_coefficients,
             "ns_eps": ns_eps,
+            "ns_dtype": ns_dtype,
             "adjust_lr": adjust_lr,
             "momentum_type": momentum_type,
             "foreach": foreach,
@@ -260,10 +267,11 @@ class Muon(Optimizer):
         ns_steps = group["ns_steps"]
         ns_coeff = group["ns_coefficients"]
         ns_eps = group["ns_eps"]
+        ns_dtype = group["ns_dtype"]
         if group["batched_ns"] and len(updates) > 1:
-            updates = newton_schulz_batched(updates, ns_steps, ns_coeff, ns_eps)
+            updates = newton_schulz_batched(updates, ns_steps, ns_coeff, ns_eps, ns_dtype)
         else:
-            updates = [newton_schulz(u, ns_steps, ns_coeff, ns_eps) for u in updates]
+            updates = [newton_schulz(u, ns_steps, ns_coeff, ns_eps, ns_dtype) for u in updates]
 
         # --- Aspect-ratio scaling for "original" mode ---
         adjust_lr = group["adjust_lr"]
@@ -323,6 +331,7 @@ class Muon(Optimizer):
         ns_steps = group["ns_steps"]
         ns_coeff = group["ns_coefficients"]
         ns_eps = group["ns_eps"]
+        ns_dtype = group["ns_dtype"]
         lr = group["lr"]
         wd = group["weight_decay"]
         adjust_lr = group["adjust_lr"]
@@ -368,7 +377,7 @@ class Muon(Optimizer):
                     update = mb.clone()
 
                 # Newton-Schulz
-                update = newton_schulz(update, ns_steps, ns_coeff, ns_eps)
+                update = newton_schulz(update, ns_steps, ns_coeff, ns_eps, ns_dtype)
 
                 # Aspect-ratio scaling for "original" mode
                 if adjust_lr == "original":

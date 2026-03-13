@@ -15,6 +15,7 @@ from ._muon import Muon
 from ._newton_schulz import newton_schulz
 from ._newton_schulz import newton_schulz_batched
 from ._newton_schulz import NS_COEFFICIENTS_DEFAULT
+from ._newton_schulz import NS_DTYPE_DEFAULT
 from ._newton_schulz import NS_EPS_DEFAULT
 from ._newton_schulz import NS_STEPS_DEFAULT
 from ._routing import is_muon_eligible
@@ -23,6 +24,7 @@ from ._routing import PartitionResult
 
 __all__ = [
     "NS_COEFFICIENTS_DEFAULT",
+    "NS_DTYPE_DEFAULT",
     "NS_EPS_DEFAULT",
     "NS_STEPS_DEFAULT",
     "AdjustLrMode",

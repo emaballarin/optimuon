@@ -23,15 +23,19 @@ from torch import Tensor
 from torch.optim.optimizer import Optimizer
 
 from ._corrections import apply_cautious_mask
+from ._corrections import apply_cautious_weight_decay
 from ._corrections import apply_mars_correction
+from ._corrections import apply_normuon_rescale
 from ._corrections import clip_grad_norm_foreach
 from ._corrections import clip_update_norm_foreach
 from ._newton_schulz import newton_schulz
 from ._newton_schulz import newton_schulz_batched
-from ._newton_schulz import NS_COEFFICIENTS_DEFAULT
+from ._newton_schulz import NS_COEFFICIENTS_POLAR_EXPRESS
 from ._newton_schulz import NS_DTYPE_DEFAULT
 from ._newton_schulz import NS_EPS_DEFAULT
+from ._newton_schulz import NS_NORM_SCALE_POLAR_EXPRESS
 from ._newton_schulz import NS_STEPS_DEFAULT
+from ._newton_schulz import NSCoefficients
 
 __all__ = ["Muon"]
 
@@ -61,8 +65,11 @@ class Muon(Optimizer):
         nesterov: Use Nesterov momentum.
         weight_decay: Decoupled weight decay (AdamW-style).
         ns_steps: Newton-Schulz iterations.
-        ns_coefficients: Quintic polynomial coefficients ``(a, b, c)``.
+        ns_coefficients: Quintic polynomial coefficients ``(a, b, c)`` or per-step
+            coefficients (Polar Express). Defaults to Polar Express.
         ns_eps: Stability constant for NS normalization.
+        ns_norm_scale: Frobenius-norm contraction factor for NS. 1.0 = no contraction,
+            1.02 = Polar Express default.
         ns_dtype: Dtype for NS iterations. Defaults to ``torch.bfloat16`` for speed.
             ``None`` preserves input dtype (original behavior).
         adjust_lr: LR scaling mode. ``"original"`` applies KJ aspect-ratio scaling
@@ -76,6 +83,10 @@ class Muon(Optimizer):
         mars: Enable MARS gradient correction.
         mars_gamma: MARS correction strength.
         cautious: Enable cautious update masking.
+        cautious_wd: Enable cautious weight decay (WD only where update and param
+            agree in sign).
+        normuon: Enable NorMuon adaptive variance reduction.
+        normuon_beta2: Second-moment EMA coefficient for NorMuon.
         grad_clip: Clip global gradient norm to this value.
         update_clip: Clip global update norm to this value (not supported with
             ``distributed=True``).
@@ -90,8 +101,9 @@ class Muon(Optimizer):
         nesterov: bool = True,
         weight_decay: float = 0.0,
         ns_steps: int = NS_STEPS_DEFAULT,
-        ns_coefficients: tuple[float, float, float] = NS_COEFFICIENTS_DEFAULT,
+        ns_coefficients: NSCoefficients = NS_COEFFICIENTS_POLAR_EXPRESS,
         ns_eps: float = NS_EPS_DEFAULT,
+        ns_norm_scale: float = NS_NORM_SCALE_POLAR_EXPRESS,
         ns_dtype: torch.dtype | None = NS_DTYPE_DEFAULT,
         adjust_lr: AdjustLrMode = "original",
         momentum_type: MomentumType = "ema",
@@ -100,6 +112,9 @@ class Muon(Optimizer):
         mars: bool = False,
         mars_gamma: float = 0.025,
         cautious: bool = False,
+        cautious_wd: bool = True,
+        normuon: bool = True,
+        normuon_beta2: float = 0.95,
         grad_clip: float | None = None,
         update_clip: float | None = None,
         distributed: bool = False,
@@ -124,8 +139,12 @@ class Muon(Optimizer):
             raise ValueError(f"Invalid update_clip: {update_clip}")
         if ns_eps <= 0.0:
             raise ValueError(f"Invalid ns_eps: {ns_eps}")
+        if ns_norm_scale <= 0.0:
+            raise ValueError(f"Invalid ns_norm_scale: {ns_norm_scale}")
         if ns_dtype is not None and not isinstance(ns_dtype, torch.dtype):
             raise TypeError(f"ns_dtype must be a torch.dtype or None, got {type(ns_dtype)}")
+        if not 0.0 < normuon_beta2 < 1.0:
+            raise ValueError(f"Invalid normuon_beta2: {normuon_beta2}")
 
         if update_clip is not None and distributed:
             warnings.warn(
@@ -141,6 +160,7 @@ class Muon(Optimizer):
             "ns_steps": ns_steps,
             "ns_coefficients": ns_coefficients,
             "ns_eps": ns_eps,
+            "ns_norm_scale": ns_norm_scale,
             "ns_dtype": ns_dtype,
             "adjust_lr": adjust_lr,
             "momentum_type": momentum_type,
@@ -149,6 +169,9 @@ class Muon(Optimizer):
             "mars": mars,
             "mars_gamma": mars_gamma,
             "cautious": cautious,
+            "cautious_wd": cautious_wd,
+            "normuon": normuon,
+            "normuon_beta2": normuon_beta2,
             "grad_clip": grad_clip,
             "update_clip": update_clip,
             "distributed": distributed,
@@ -183,9 +206,11 @@ class Muon(Optimizer):
         grads: list[Tensor] = []
         momentum_bufs: list[Tensor] = []
         prev_grads: list[Tensor | None] = []
+        normuon_bufs: list[Tensor] = []
 
         beta = group["momentum"]
         use_mars = group["mars"]
+        use_normuon = group["normuon"]
         momentum_type = group["momentum_type"]
 
         for p in group["params"]:
@@ -202,9 +227,17 @@ class Muon(Optimizer):
                     state["prev_grad"] = None
             state["step"] += 1
 
+            if use_normuon and "normuon_buffer" not in state:
+                shape_2d = (p.shape[0], p[0].numel()) if p.ndim > 2 else tuple(p.shape)
+                rows, cols = shape_2d
+                buf_shape = (rows, 1) if rows >= cols else (1, cols)
+                state["normuon_buffer"] = torch.zeros(buf_shape, device=p.device, dtype=p.dtype)
+
             momentum_bufs.append(state["momentum_buffer"])
             if use_mars:
                 prev_grads.append(state.get("prev_grad"))
+            if use_normuon:
+                normuon_bufs.append(state["normuon_buffer"])
 
         if not params_with_grad:
             return
@@ -261,17 +294,28 @@ class Muon(Optimizer):
                 else:
                     updates = [mb * beta + g for mb, g in zip(momentum_bufs, grads)]
         else:
-            updates = [mb.clone() for mb in momentum_bufs]
+            updates = list(momentum_bufs)
 
         # --- Newton-Schulz orthogonalization ---
         ns_steps = group["ns_steps"]
         ns_coeff = group["ns_coefficients"]
         ns_eps = group["ns_eps"]
         ns_dtype = group["ns_dtype"]
+        ns_norm_scale = group["ns_norm_scale"]
         if group["batched_ns"] and len(updates) > 1:
-            updates = newton_schulz_batched(updates, ns_steps, ns_coeff, ns_eps, ns_dtype)
+            updates = newton_schulz_batched(updates, ns_steps, ns_coeff, ns_eps, ns_dtype, ns_norm_scale)
         else:
-            updates = [newton_schulz(u, ns_steps, ns_coeff, ns_eps, ns_dtype) for u in updates]
+            updates = [newton_schulz(u, ns_steps, ns_coeff, ns_eps, ns_dtype, ns_norm_scale) for u in updates]
+
+        # --- NorMuon adaptive variance reduction ---
+        if use_normuon:
+            for i, (u, p) in enumerate(zip(updates, params_with_grad)):
+                shape_2d = (p.shape[0], p[0].numel()) if p.ndim > 2 else tuple(p.shape)
+                rows, cols = shape_2d
+                red_dim = -1 if rows >= cols else -2
+                u_2d = u.reshape(rows, cols)
+                u_2d = apply_normuon_rescale(u_2d, normuon_bufs[i], group["normuon_beta2"], red_dim)
+                updates[i] = u_2d.reshape(u.shape)
 
         # --- Aspect-ratio scaling for "original" mode ---
         adjust_lr = group["adjust_lr"]
@@ -279,7 +323,7 @@ class Muon(Optimizer):
             for i, p in enumerate(params_with_grad):
                 ratio_scale = _aspect_ratio_scale(p)
                 if ratio_scale != 1.0:
-                    updates[i] = updates[i] * ratio_scale
+                    updates[i].mul_(ratio_scale)
 
         # --- Cautious masking ---
         if group["cautious"]:
@@ -293,7 +337,23 @@ class Muon(Optimizer):
         lr = group["lr"]
         wd = group["weight_decay"]
 
-        if use_foreach and adjust_lr in ("original", "none"):
+        if group["cautious_wd"] and wd > 0:
+            if adjust_lr == "match_rms_adamw":
+                # Per-param LR — must loop for both WD and update
+                for p, u in zip(params_with_grad, updates):
+                    effective_lr = lr * _match_rms_adamw_scale(p)
+                    apply_cautious_weight_decay(p, u, effective_lr, wd)
+                    p.add_(u.reshape(p.shape), alpha=-effective_lr)
+            else:
+                # Uniform LR — loop for cautious WD, foreach for update
+                for p, u in zip(params_with_grad, updates):
+                    apply_cautious_weight_decay(p, u, lr, wd)
+                if use_foreach:
+                    torch._foreach_add_(params_with_grad, updates, alpha=-lr)  # type: ignore[attr-defined]
+                else:
+                    for p, u in zip(params_with_grad, updates):
+                        p.add_(u.reshape(p.shape), alpha=-lr)
+        elif use_foreach and adjust_lr in ("original", "none"):
             # Uniform LR -> single foreach call
             if wd > 0:
                 torch._foreach_mul_(params_with_grad, 1.0 - lr * wd)  # type: ignore[attr-defined]
@@ -331,11 +391,14 @@ class Muon(Optimizer):
         ns_steps = group["ns_steps"]
         ns_coeff = group["ns_coefficients"]
         ns_eps = group["ns_eps"]
+        ns_norm_scale = group["ns_norm_scale"]
         ns_dtype = group["ns_dtype"]
         lr = group["lr"]
         wd = group["weight_decay"]
         adjust_lr = group["adjust_lr"]
         use_mars = group["mars"]
+        use_normuon = group["normuon"]
+        use_cautious_wd = group["cautious_wd"]
 
         # Sort by descending numel for load balancing
         order = sorted(range(len(params)), key=lambda i: params[i].numel(), reverse=True)
@@ -374,16 +437,31 @@ class Muon(Optimizer):
                     else:  # classical
                         update = mb * beta + g
                 else:
-                    update = mb.clone()
+                    update = mb
 
                 # Newton-Schulz
-                update = newton_schulz(update, ns_steps, ns_coeff, ns_eps, ns_dtype)
+                update = newton_schulz(update, ns_steps, ns_coeff, ns_eps, ns_dtype, ns_norm_scale)
+
+                # NorMuon
+                if use_normuon:
+                    state = self.state[p]
+                    if "normuon_buffer" not in state:
+                        shape_2d = (p.shape[0], p[0].numel()) if p.ndim > 2 else tuple(p.shape)
+                        rows, cols = shape_2d
+                        buf_shape = (rows, 1) if rows >= cols else (1, cols)
+                        state["normuon_buffer"] = torch.zeros(buf_shape, device=p.device, dtype=p.dtype)
+                    shape_2d = (p.shape[0], p[0].numel()) if p.ndim > 2 else tuple(p.shape)
+                    rows, cols = shape_2d
+                    red_dim = -1 if rows >= cols else -2
+                    u_2d = update.reshape(rows, cols)
+                    u_2d = apply_normuon_rescale(u_2d, state["normuon_buffer"], group["normuon_beta2"], red_dim)
+                    update = u_2d.reshape(update.shape)
 
                 # Aspect-ratio scaling for "original" mode
                 if adjust_lr == "original":
                     ratio_scale = _aspect_ratio_scale(p)
                     if ratio_scale != 1.0:
-                        update = update * ratio_scale
+                        update.mul_(ratio_scale)
 
                 # Cautious
                 if group["cautious"]:
@@ -391,7 +469,9 @@ class Muon(Optimizer):
 
                 # Weight decay + update
                 effective_lr = lr * _match_rms_adamw_scale(p) if adjust_lr == "match_rms_adamw" else lr
-                if wd > 0:
+                if use_cautious_wd and wd > 0:
+                    apply_cautious_weight_decay(p, update, effective_lr, wd)
+                elif wd > 0:
                     p.mul_(1.0 - effective_lr * wd)
                 p.add_(update.reshape(p.shape), alpha=-effective_lr)
 

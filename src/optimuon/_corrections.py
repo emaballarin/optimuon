@@ -3,6 +3,8 @@
 - MARS: gradient correction using consecutive gradient differences.
 - Cautious: masks update components that disagree in sign with the gradient.
 - Clipping: gradient-norm and update-norm clipping (foreach-friendly).
+- NorMuon: adaptive per-dimension variance reduction.
+- Cautious weight decay: WD masked by update–parameter sign alignment.
 """
 
 import torch
@@ -10,7 +12,9 @@ from torch import Tensor
 
 __all__ = [
     "apply_cautious_mask",
+    "apply_cautious_weight_decay",
     "apply_mars_correction",
+    "apply_normuon_rescale",
     "clip_grad_norm_foreach",
     "clip_update_norm_foreach",
 ]
@@ -44,6 +48,39 @@ def apply_cautious_mask(update: Tensor, grad: Tensor) -> Tensor:
     if n_surviving > 0:
         masked = masked * (mask.numel() / n_surviving)
     return masked
+
+
+def apply_normuon_rescale(
+    update: Tensor,
+    second_momentum_buffer: Tensor,
+    beta2: float,
+    red_dim: int,
+) -> Tensor:
+    """NorMuon: rescale per-dimension variance while preserving total norm.
+
+    Applies adaptive variance reduction via a second-moment EMA, rescaling each
+    row (or column) of the update to equalize variance across dimensions while
+    keeping the overall Frobenius norm unchanged. Mutates buffer in-place.
+    """
+    v_mean = update.float().square().mean(dim=red_dim, keepdim=True)
+    red_dim_size = update.size(red_dim)
+    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
+    v_norm = v_norm_sq.sqrt()
+
+    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+
+    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
+    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
+    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
+
+    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
+    return update * final_scale.to(update.dtype)
+
+
+def apply_cautious_weight_decay(param: Tensor, update: Tensor, lr: float, wd: float) -> None:
+    """Weight decay only where update and param agree in sign. Modifies param in-place."""
+    mask = (update * param >= 0).to(param.dtype)
+    param.sub_(lr * wd * param * mask)
 
 
 def clip_grad_norm_foreach(grads: list[Tensor], max_norm: float) -> float:

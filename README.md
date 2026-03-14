@@ -10,7 +10,8 @@ A performance-optimized [Muon](https://kellerjordan.github.io/posts/muon/) optim
 - **Composite optimizer**: `CompositeMuon` combines Muon with any arbitrary auxiliary optimizer (not just AdamW).
 - **Three LR modes**: Keller Jordan's `"original"` (with aspect-ratio scaling), Moonshot AI's `"match_rms_adamw"`, and `"none"` (no scaling).
 - **Momentum conventions**: `"ema"` (`m = beta*m + (1-beta)*g`, default) and `"classical"` (`m = beta*m + g`).
-- **Corrections**: MARS, cautious updates, gradient/update clipping (all toggleable).
+- **Corrections**: MARS, cautious updates, cautious weight decay, NorMuon, gradient/update clipping (all toggleable).
+- **Polar Express**: optimal per-step Newton-Schulz coefficients (default).
 - **Distributed**: `torch.distributed` gradient sharding via `all_gather`.
 
 ## Installation
@@ -108,8 +109,13 @@ print(f"Aux:  {result.aux_names}")
 ## References
 
 - Keller Jordan et al., [Muon: An optimizer for hidden layers in neural networks](https://kellerjordan.github.io/posts/muon/) (2024)
+- Huizhuo Yuan et al., [MARS: Unleashing the Power of Variance Reduction for Training Large Models](https://arxiv.org/abs/2411.10438) (2024)
+- Kaizhao Liang et al., [Cautious Optimizers: Improving Training with One Line of Code](https://arxiv.org/abs/2411.16085) (2024)
 - Moonshot AI, [Muon is Scalable for LLM Training](https://arxiv.org/abs/2502.16982) (2025)
 - Essential AI, [Practical Efficiency of Muon for Pretraining](https://arxiv.org/abs/2505.02222) (2025)
+- Noah Amsel et al., [The Polar Express: Optimal Matrix Sign Methods and Their Application to the Muon Algorithm](https://arxiv.org/abs/2505.16932) (2025)
+- Zichong Li et al., [NorMuon: Making Muon more efficient and scalable](https://arxiv.org/abs/2510.05491) (2025)
+- Lizhang Chen et al., [Cautious Weight Decay](https://arxiv.org/abs/2510.12402) (2025)
 
 ## License
 

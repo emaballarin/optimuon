@@ -11,6 +11,8 @@ A performance-optimized [Muon](https://kellerjordan.github.io/posts/muon/) optim
 - **Three LR modes**: Keller Jordan's `"original"` (with aspect-ratio scaling), Moonshot AI's `"match_rms_adamw"`, and `"none"` (no scaling).
 - **Momentum conventions**: `"ema"` (`m = beta*m + (1-beta)*g`, default) and `"classical"` (`m = beta*m + g`).
 - **Corrections**: MARS, cautious updates, cautious weight decay, NorMuon, gradient/update clipping (all toggleable).
+- **Weight normalization**: optional Frobenius-norm clamping to `sqrt(fan_out)` (from KJ's original Muon).
+- **Half-precision momentum**: optional lower-precision momentum buffers for memory savings.
 - **Polar Express**: optimal per-step Newton-Schulz coefficients (default).
 - **Distributed**: `torch.distributed` gradient sharding via `all_gather`.
 
@@ -78,6 +80,7 @@ optimizer = CompositeMuon(
         "mars": True,           # MARS gradient correction
         "cautious": True,       # cautious update masking
         "grad_clip": 1.0,       # gradient norm clipping
+        "weight_norm": True,    # Frobenius-norm clamping
     },
     aux_optimizer_class=torch.optim.AdamW,
     aux_optimizer_kwargs={"lr": 3e-4},

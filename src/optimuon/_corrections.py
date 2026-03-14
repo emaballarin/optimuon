@@ -5,6 +5,7 @@
 - Clipping: gradient-norm and update-norm clipping (foreach-friendly).
 - NorMuon: adaptive per-dimension variance reduction.
 - Cautious weight decay: WD masked by update–parameter sign alignment.
+- Weight normalization: Frobenius-norm clamping to sqrt(fan_out).
 """
 
 import torch
@@ -15,6 +16,7 @@ __all__ = [
     "apply_cautious_weight_decay",
     "apply_mars_correction",
     "apply_normuon_rescale",
+    "apply_weight_norm",
     "clip_grad_norm_foreach",
     "clip_update_norm_foreach",
 ]
@@ -75,6 +77,14 @@ def apply_normuon_rescale(
 
     final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
     return update * final_scale.to(update.dtype)
+
+
+def apply_weight_norm(param: Tensor) -> None:
+    """Normalize param Frobenius norm to sqrt(fan_out). Modifies param in-place."""
+    target_norm = param.shape[0] ** 0.5
+    current_norm = param.norm()
+    if current_norm > 0:
+        param.mul_(target_norm / current_norm)
 
 
 def apply_cautious_weight_decay(param: Tensor, update: Tensor, lr: float, wd: float) -> None:

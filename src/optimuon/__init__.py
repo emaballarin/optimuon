@@ -1,7 +1,7 @@
 """optimuon — A performance-optimized Muon optimizer for PyTorch.
 
 Foreach-native Muon with auto-parameter routing, composite optimizer patterns,
-and optional corrections (MARS, cautious, clipping, NorMuon, Polar Express).
+and optional corrections (MARS, cautious, clipping, NorMuon, weight normalization, Polar Express).
 """
 
 from ._composite import CompositeMuon
@@ -9,6 +9,7 @@ from ._corrections import apply_cautious_mask
 from ._corrections import apply_cautious_weight_decay
 from ._corrections import apply_mars_correction
 from ._corrections import apply_normuon_rescale
+from ._corrections import apply_weight_norm
 from ._corrections import clip_grad_norm_foreach
 from ._corrections import clip_update_norm_foreach
 from ._muon import AdjustLrMode
@@ -46,6 +47,7 @@ __all__ = [
     "apply_cautious_weight_decay",
     "apply_mars_correction",
     "apply_normuon_rescale",
+    "apply_weight_norm",
     "clip_grad_norm_foreach",
     "clip_update_norm_foreach",
     "is_muon_eligible",

@@ -26,6 +26,7 @@ from ._corrections import apply_cautious_mask
 from ._corrections import apply_cautious_weight_decay
 from ._corrections import apply_mars_correction
 from ._corrections import apply_normuon_rescale
+from ._corrections import apply_weight_norm
 from ._corrections import clip_grad_norm_foreach
 from ._corrections import clip_update_norm_foreach
 from ._newton_schulz import newton_schulz
@@ -78,6 +79,9 @@ class Muon(Optimizer):
             ``"none"`` applies no scaling (manual LR tuning).
         momentum_type: Momentum convention. ``"ema"`` uses ``m = beta*m + (1-beta)*g``
             (dominant convention). ``"classical"`` uses ``m = beta*m + g``.
+        momentum_dtype: Dtype for momentum buffers. ``None`` inherits param dtype
+            (default). Set to a lower-precision dtype (e.g., ``torch.bfloat16``) to
+            reduce memory.
         foreach: Use ``torch._foreach_*`` for momentum/WD/update steps.
         batched_ns: Batch matrices by shape for Newton-Schulz.
         mars: Enable MARS gradient correction.
@@ -87,6 +91,9 @@ class Muon(Optimizer):
             agree in sign).
         normuon: Enable NorMuon adaptive variance reduction.
         normuon_beta2: Second-moment EMA coefficient for NorMuon.
+        weight_norm: Normalize each weight matrix's Frobenius norm to ``sqrt(fan_out)``
+            before each update. Prevents weight scale drift since Muon produces
+            direction-only (orthogonalized) updates.
         grad_clip: Clip global gradient norm to this value.
         update_clip: Clip global update norm to this value (not supported with
             ``distributed=True``).
@@ -107,6 +114,7 @@ class Muon(Optimizer):
         ns_dtype: torch.dtype | None = NS_DTYPE_DEFAULT,
         adjust_lr: AdjustLrMode = "original",
         momentum_type: MomentumType = "ema",
+        momentum_dtype: torch.dtype | None = None,
         foreach: bool = True,
         batched_ns: bool = True,
         mars: bool = False,
@@ -115,6 +123,7 @@ class Muon(Optimizer):
         cautious_wd: bool = True,
         normuon: bool = True,
         normuon_beta2: float = 0.95,
+        weight_norm: bool = False,
         grad_clip: float | None = None,
         update_clip: float | None = None,
         distributed: bool = False,
@@ -143,6 +152,8 @@ class Muon(Optimizer):
             raise ValueError(f"Invalid ns_norm_scale: {ns_norm_scale}")
         if ns_dtype is not None and not isinstance(ns_dtype, torch.dtype):
             raise TypeError(f"ns_dtype must be a torch.dtype or None, got {type(ns_dtype)}")
+        if momentum_dtype is not None and not isinstance(momentum_dtype, torch.dtype):
+            raise TypeError(f"momentum_dtype must be a torch.dtype or None, got {type(momentum_dtype)}")
         if not 0.0 < normuon_beta2 < 1.0:
             raise ValueError(f"Invalid normuon_beta2: {normuon_beta2}")
 
@@ -164,6 +175,7 @@ class Muon(Optimizer):
             "ns_dtype": ns_dtype,
             "adjust_lr": adjust_lr,
             "momentum_type": momentum_type,
+            "momentum_dtype": momentum_dtype,
             "foreach": foreach,
             "batched_ns": batched_ns,
             "mars": mars,
@@ -172,6 +184,7 @@ class Muon(Optimizer):
             "cautious_wd": cautious_wd,
             "normuon": normuon,
             "normuon_beta2": normuon_beta2,
+            "weight_norm": weight_norm,
             "grad_clip": grad_clip,
             "update_clip": update_clip,
             "distributed": distributed,
@@ -222,7 +235,7 @@ class Muon(Optimizer):
             state = self.state[p]
             if len(state) == 0:
                 state["step"] = 0
-                state["momentum_buffer"] = torch.zeros_like(p)
+                state["momentum_buffer"] = torch.zeros_like(p, dtype=group["momentum_dtype"] or p.dtype)
                 if use_mars:
                     state["prev_grad"] = None
             state["step"] += 1
@@ -263,38 +276,51 @@ class Muon(Optimizer):
 
         # --- Momentum update ---
         use_foreach = group["foreach"]
+        _needs_cast = (
+            group["momentum_dtype"] is not None and len(grads) > 0 and grads[0].dtype != momentum_bufs[0].dtype
+        )
+        if _needs_cast and use_foreach:
+            _grads_for_momentum = [g.to(momentum_bufs[0].dtype) for g in grads]
+        else:
+            _grads_for_momentum = grads
+
         if momentum_type == "ema":
             if use_foreach:
                 torch._foreach_mul_(momentum_bufs, beta)  # type: ignore[attr-defined]
-                torch._foreach_add_(momentum_bufs, grads, alpha=1.0 - beta)  # type: ignore[attr-defined]
+                torch._foreach_add_(momentum_bufs, _grads_for_momentum, alpha=1.0 - beta)  # type: ignore[attr-defined]
             else:
                 for mb, g in zip(momentum_bufs, grads):
                     mb.mul_(beta).add_(g, alpha=1.0 - beta)
         else:  # classical
             if use_foreach:
                 torch._foreach_mul_(momentum_bufs, beta)  # type: ignore[attr-defined]
-                torch._foreach_add_(momentum_bufs, grads)  # type: ignore[attr-defined]
+                torch._foreach_add_(momentum_bufs, _grads_for_momentum)  # type: ignore[attr-defined]
             else:
                 for mb, g in zip(momentum_bufs, grads):
                     mb.mul_(beta).add_(g)
 
         # --- Nesterov extrapolation ---
+        if _needs_cast:
+            _mbufs = [mb.to(grads[0].dtype) for mb in momentum_bufs]
+        else:
+            _mbufs = momentum_bufs
+
         if group["nesterov"]:
             if momentum_type == "ema":
                 if use_foreach:
                     updates = torch._foreach_mul(grads, 1.0 - beta)  # type: ignore[attr-defined]
-                    bufs_scaled = torch._foreach_mul(momentum_bufs, beta)  # type: ignore[attr-defined]
+                    bufs_scaled = torch._foreach_mul(_mbufs, beta)  # type: ignore[attr-defined]
                     torch._foreach_add_(updates, bufs_scaled)  # type: ignore[attr-defined]
                 else:
-                    updates = [(1.0 - beta) * g + beta * mb for g, mb in zip(grads, momentum_bufs)]
+                    updates = [(1.0 - beta) * g + beta * mb for g, mb in zip(grads, _mbufs)]
             else:  # classical
                 if use_foreach:
-                    updates = torch._foreach_mul(momentum_bufs, beta)  # type: ignore[attr-defined]
+                    updates = torch._foreach_mul(_mbufs, beta)  # type: ignore[attr-defined]
                     torch._foreach_add_(updates, grads)  # type: ignore[attr-defined]
                 else:
-                    updates = [mb * beta + g for mb, g in zip(momentum_bufs, grads)]
+                    updates = [mb * beta + g for mb, g in zip(_mbufs, grads)]
         else:
-            updates = list(momentum_bufs)
+            updates = list(_mbufs)
 
         # --- Newton-Schulz orthogonalization ---
         ns_steps = group["ns_steps"]
@@ -332,6 +358,11 @@ class Muon(Optimizer):
         # --- Update clipping ---
         if group["update_clip"] is not None:
             clip_update_norm_foreach(updates, group["update_clip"])
+
+        # --- Weight normalization ---
+        if group["weight_norm"]:
+            for p in params_with_grad:
+                apply_weight_norm(p)
 
         # --- Weight decay + parameter update ---
         lr = group["lr"]
@@ -398,6 +429,7 @@ class Muon(Optimizer):
         adjust_lr = group["adjust_lr"]
         use_mars = group["mars"]
         use_normuon = group["normuon"]
+        use_weight_norm = group["weight_norm"]
         use_cautious_wd = group["cautious_wd"]
 
         # Sort by descending numel for load balancing
@@ -437,7 +469,9 @@ class Muon(Optimizer):
                     else:  # classical
                         update = mb * beta + g
                 else:
-                    update = mb
+                    update = mb.to(p.dtype) if mb.dtype != p.dtype else mb
+                if update.dtype != p.dtype:
+                    update = update.to(p.dtype)
 
                 # Newton-Schulz
                 update = newton_schulz(update, ns_steps, ns_coeff, ns_eps, ns_dtype, ns_norm_scale)
@@ -466,6 +500,10 @@ class Muon(Optimizer):
                 # Cautious
                 if group["cautious"]:
                     update = apply_cautious_mask(update, g)
+
+                # Weight normalization
+                if use_weight_norm:
+                    apply_weight_norm(p)
 
                 # Weight decay + update
                 effective_lr = lr * _match_rms_adamw_scale(p) if adjust_lr == "match_rms_adamw" else lr

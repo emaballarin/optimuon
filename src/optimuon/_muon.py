@@ -154,7 +154,7 @@ class Muon(Optimizer):
             raise TypeError(f"ns_dtype must be a torch.dtype or None, got {type(ns_dtype)}")
         if momentum_dtype is not None and not isinstance(momentum_dtype, torch.dtype):
             raise TypeError(f"momentum_dtype must be a torch.dtype or None, got {type(momentum_dtype)}")
-        if not 0.0 < normuon_beta2 < 1.0:
+        if not 0.0 <= normuon_beta2 < 1.0:
             raise ValueError(f"Invalid normuon_beta2: {normuon_beta2}")
 
         if update_clip is not None and distributed:

@@ -29,6 +29,10 @@ from ._corrections import apply_normuon_rescale
 from ._corrections import apply_weight_norm
 from ._corrections import clip_grad_norm_foreach
 from ._corrections import clip_update_norm_foreach
+from ._newton_schulz import GNS_DTYPE_DEFAULT
+from ._newton_schulz import GNS_RESTART_AFTER_DEFAULT
+from ._newton_schulz import gram_newton_schulz
+from ._newton_schulz import gram_newton_schulz_batched
 from ._newton_schulz import newton_schulz
 from ._newton_schulz import newton_schulz_batched
 from ._newton_schulz import NS_COEFFICIENTS_POLAR_EXPRESS
@@ -42,6 +46,8 @@ __all__ = ["Muon"]
 
 AdjustLrMode = Literal["original", "match_rms_adamw", "none"]
 MomentumType = Literal["ema", "classical"]
+
+_NS_DTYPE_UNSET = object()  # Sentinel: ns_dtype not explicitly passed by user.
 
 
 def _match_rms_adamw_scale(param: Tensor) -> float:
@@ -71,8 +77,15 @@ class Muon(Optimizer):
         ns_eps: Stability constant for NS normalization.
         ns_norm_scale: Frobenius-norm contraction factor for NS. 1.0 = no contraction,
             1.02 = Polar Express default.
-        ns_dtype: Dtype for NS iterations. Defaults to ``torch.bfloat16`` for speed.
+        ns_dtype: Dtype for NS iterations. When not specified explicitly, defaults
+            to ``torch.float16`` if ``gram_ns=True`` or ``torch.bfloat16`` otherwise.
             ``None`` preserves input dtype (original behavior).
+        gram_ns: Use Gram Newton-Schulz reformulation for rectangular matrices.
+            Iterates on the smaller symmetric Gram matrix, reducing FLOPs by
+            40-60%. Falls back to standard NS for square matrices. Default True.
+        gns_restart_after: Re-materialize rectangular product after this many Gram
+            NS iterations to prevent half-precision divergence. ``None`` disables.
+            Default 2 (tuned for Polar Express). Ignored when ``gram_ns=False``.
         adjust_lr: LR scaling mode. ``"original"`` applies KJ aspect-ratio scaling
             ``sqrt(max(1, rows/cols))``. ``"match_rms_adamw"`` applies Moonshot's
             per-parameter scaling ``0.2 * sqrt(max(rows, cols))``.
@@ -98,6 +111,14 @@ class Muon(Optimizer):
         update_clip: Clip global update norm to this value (not supported with
             ``distributed=True``).
         distributed: Enable ``all_gather``-based gradient sharding.
+        ns_split_fn: Optional callable that splits an update tensor into a list of
+            sub-tensors before Newton-Schulz orthogonalization. Each sub-tensor is
+            orthogonalized independently, then recombined. Useful for QKV or
+            SwiGLU concatenated weights. Must be paired with ``ns_recombine_fn``.
+            Can be set per parameter group.
+        ns_recombine_fn: Callable that recombines a list of orthogonalized
+            sub-tensors back to the original shape. Must be paired with
+            ``ns_split_fn``.
     """
 
     def __init__(
@@ -111,7 +132,9 @@ class Muon(Optimizer):
         ns_coefficients: NSCoefficients = NS_COEFFICIENTS_POLAR_EXPRESS,
         ns_eps: float = NS_EPS_DEFAULT,
         ns_norm_scale: float = NS_NORM_SCALE_POLAR_EXPRESS,
-        ns_dtype: torch.dtype | None = NS_DTYPE_DEFAULT,
+        ns_dtype: torch.dtype | None = _NS_DTYPE_UNSET,  # type: ignore[assignment]
+        gram_ns: bool = True,
+        gns_restart_after: int | None = GNS_RESTART_AFTER_DEFAULT,
         adjust_lr: AdjustLrMode = "original",
         momentum_type: MomentumType = "ema",
         momentum_dtype: torch.dtype | None = None,
@@ -127,6 +150,8 @@ class Muon(Optimizer):
         grad_clip: float | None = None,
         update_clip: float | None = None,
         distributed: bool = False,
+        ns_split_fn: Callable[[Tensor], list[Tensor]] | None = None,
+        ns_recombine_fn: Callable[[list[Tensor]], Tensor] | None = None,
     ) -> None:
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -150,12 +175,19 @@ class Muon(Optimizer):
             raise ValueError(f"Invalid ns_eps: {ns_eps}")
         if ns_norm_scale <= 0.0:
             raise ValueError(f"Invalid ns_norm_scale: {ns_norm_scale}")
+        # Resolve ns_dtype sentinel: auto-select based on gram_ns.
+        if ns_dtype is _NS_DTYPE_UNSET:
+            ns_dtype = GNS_DTYPE_DEFAULT if gram_ns else NS_DTYPE_DEFAULT
         if ns_dtype is not None and not isinstance(ns_dtype, torch.dtype):
             raise TypeError(f"ns_dtype must be a torch.dtype or None, got {type(ns_dtype)}")
         if momentum_dtype is not None and not isinstance(momentum_dtype, torch.dtype):
             raise TypeError(f"momentum_dtype must be a torch.dtype or None, got {type(momentum_dtype)}")
         if not 0.0 <= normuon_beta2 < 1.0:
             raise ValueError(f"Invalid normuon_beta2: {normuon_beta2}")
+        if gns_restart_after is not None and gns_restart_after < 0:
+            raise ValueError(f"Invalid gns_restart_after: {gns_restart_after}")
+        if (ns_split_fn is None) != (ns_recombine_fn is None):
+            raise ValueError("ns_split_fn and ns_recombine_fn must both be provided or both be None")
 
         if update_clip is not None and distributed:
             warnings.warn(
@@ -173,6 +205,8 @@ class Muon(Optimizer):
             "ns_eps": ns_eps,
             "ns_norm_scale": ns_norm_scale,
             "ns_dtype": ns_dtype,
+            "gram_ns": gram_ns,
+            "gns_restart_after": gns_restart_after,
             "adjust_lr": adjust_lr,
             "momentum_type": momentum_type,
             "momentum_dtype": momentum_dtype,
@@ -188,10 +222,17 @@ class Muon(Optimizer):
             "grad_clip": grad_clip,
             "update_clip": update_clip,
             "distributed": distributed,
+            "ns_split_fn": ns_split_fn,
+            "ns_recombine_fn": ns_recombine_fn,
         }
         super().__init__(params, defaults)
 
         for group in self.param_groups:
+            # Validate split/recombine pairing in per-group overrides.
+            g_split = group.get("ns_split_fn")
+            g_recombine = group.get("ns_recombine_fn")
+            if (g_split is None) != (g_recombine is None):
+                raise ValueError("ns_split_fn and ns_recombine_fn must both be provided or both be None")
             for p in group["params"]:
                 if p.ndim < 2:
                     raise ValueError(
@@ -322,16 +363,50 @@ class Muon(Optimizer):
         else:
             updates = list(_mbufs)
 
+        # --- Weight splitting (pre-NS) ---
+        split_fn = group["ns_split_fn"]
+        recombine_fn = group["ns_recombine_fn"]
+        split_metadata: list[int] | None = None  # num sub-tensors per original update
+        if split_fn is not None:
+            expanded: list[Tensor] = []
+            split_metadata = []
+            for u in updates:
+                subs = split_fn(u)
+                split_metadata.append(len(subs))
+                expanded.extend(subs)
+            updates = expanded
+
         # --- Newton-Schulz orthogonalization ---
         ns_steps = group["ns_steps"]
         ns_coeff = group["ns_coefficients"]
         ns_eps = group["ns_eps"]
         ns_dtype = group["ns_dtype"]
         ns_norm_scale = group["ns_norm_scale"]
-        if group["batched_ns"] and len(updates) > 1:
+        use_gram_ns = group["gram_ns"]
+        if use_gram_ns:
+            gns_restart = group["gns_restart_after"]
+            if group["batched_ns"] and len(updates) > 1:
+                updates = gram_newton_schulz_batched(
+                    updates, ns_steps, ns_coeff, ns_eps, ns_dtype, ns_norm_scale, gns_restart
+                )
+            else:
+                updates = [
+                    gram_newton_schulz(u, ns_steps, ns_coeff, ns_eps, ns_dtype, ns_norm_scale, gns_restart)
+                    for u in updates
+                ]
+        elif group["batched_ns"] and len(updates) > 1:
             updates = newton_schulz_batched(updates, ns_steps, ns_coeff, ns_eps, ns_dtype, ns_norm_scale)
         else:
             updates = [newton_schulz(u, ns_steps, ns_coeff, ns_eps, ns_dtype, ns_norm_scale) for u in updates]
+
+        # --- Weight recombination (post-NS) ---
+        if split_metadata is not None:
+            recombined: list[Tensor] = []
+            idx = 0
+            for n_subs in split_metadata:
+                recombined.append(recombine_fn(updates[idx : idx + n_subs]))  # type: ignore[misc]
+                idx += n_subs
+            updates = recombined
 
         # --- NorMuon adaptive variance reduction ---
         if use_normuon:
@@ -424,6 +499,8 @@ class Muon(Optimizer):
         ns_eps = group["ns_eps"]
         ns_norm_scale = group["ns_norm_scale"]
         ns_dtype = group["ns_dtype"]
+        use_gram_ns = group["gram_ns"]
+        gns_restart = group["gns_restart_after"]
         lr = group["lr"]
         wd = group["weight_decay"]
         adjust_lr = group["adjust_lr"]
@@ -473,8 +550,25 @@ class Muon(Optimizer):
                 if update.dtype != p.dtype:
                     update = update.to(p.dtype)
 
-                # Newton-Schulz
-                update = newton_schulz(update, ns_steps, ns_coeff, ns_eps, ns_dtype, ns_norm_scale)
+                # Newton-Schulz (with optional weight splitting)
+                d_split_fn = group["ns_split_fn"]
+                d_recombine_fn = group["ns_recombine_fn"]
+                if d_split_fn is not None:
+                    subs = d_split_fn(update)
+                    if use_gram_ns:
+                        subs = [
+                            gram_newton_schulz(s, ns_steps, ns_coeff, ns_eps, ns_dtype, ns_norm_scale, gns_restart)
+                            for s in subs
+                        ]
+                    else:
+                        subs = [newton_schulz(s, ns_steps, ns_coeff, ns_eps, ns_dtype, ns_norm_scale) for s in subs]
+                    update = d_recombine_fn(subs)  # type: ignore[misc]
+                elif use_gram_ns:
+                    update = gram_newton_schulz(
+                        update, ns_steps, ns_coeff, ns_eps, ns_dtype, ns_norm_scale, gns_restart
+                    )
+                else:
+                    update = newton_schulz(update, ns_steps, ns_coeff, ns_eps, ns_dtype, ns_norm_scale)
 
                 # NorMuon
                 if use_normuon:

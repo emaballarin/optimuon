@@ -15,6 +15,10 @@ from ._corrections import clip_update_norm_foreach
 from ._muon import AdjustLrMode
 from ._muon import MomentumType
 from ._muon import Muon
+from ._newton_schulz import GNS_DTYPE_DEFAULT
+from ._newton_schulz import GNS_RESTART_AFTER_DEFAULT
+from ._newton_schulz import gram_newton_schulz
+from ._newton_schulz import gram_newton_schulz_batched
 from ._newton_schulz import newton_schulz
 from ._newton_schulz import newton_schulz_batched
 from ._newton_schulz import NS_COEFFICIENTS_DEFAULT
@@ -30,6 +34,8 @@ from ._routing import partition_params
 from ._routing import PartitionResult
 
 __all__ = [
+    "GNS_DTYPE_DEFAULT",
+    "GNS_RESTART_AFTER_DEFAULT",
     "NS_COEFFICIENTS_DEFAULT",
     "NS_COEFFICIENTS_POLAR_EXPRESS",
     "NS_DTYPE_DEFAULT",
@@ -50,6 +56,8 @@ __all__ = [
     "apply_weight_norm",
     "clip_grad_norm_foreach",
     "clip_update_norm_foreach",
+    "gram_newton_schulz",
+    "gram_newton_schulz_batched",
     "is_muon_eligible",
     "newton_schulz",
     "newton_schulz_batched",

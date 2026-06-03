@@ -32,8 +32,8 @@ See `PROJECT.md` (if present) for project-specific structure, conventions, and d
 
 - **Front-load questions.** Ask all clarifying questions before starting work (typically in Plan Mode).
 - **Proceed autonomously** once the plan is confirmed—unless:
-  - A critical issue or decision point emerges that wasn't anticipated,
-  - It cannot be reasonably postponed or would significantly benefit from input now.
+    - A critical issue or decision point emerges that wasn't anticipated,
+    - It cannot be reasonably postponed or would significantly benefit from input now.
 - **When in doubt, ask.** A brief pause beats compounding a wrong assumption.
 - **Don't re-derive settled decisions.** Check existing logs, records, and memory first.
 

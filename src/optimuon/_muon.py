@@ -44,7 +44,7 @@ from ._newton_schulz import NSCoefficients
 
 __all__ = ["Muon"]
 
-AdjustLrMode = Literal["original", "match_rms_adamw", "none"]
+AdjustLrMode = Literal["original", "match_rms_adamw", "none", "mup", "interp"]
 MomentumType = Literal["ema", "classical"]
 
 _NS_DTYPE_UNSET = object()  # Sentinel: ns_dtype not explicitly passed by user.
@@ -56,10 +56,22 @@ def _match_rms_adamw_scale(param: Tensor) -> float:
     return 0.2 * math.sqrt(max(shape_2d[0], shape_2d[1]))
 
 
-def _aspect_ratio_scale(param: Tensor) -> float:
-    """Compute KJ's aspect-ratio scaling: sqrt(max(1, rows/cols))."""
+def _spectral_scale(param: Tensor, floor: float) -> float:
+    """Aspect-ratio update scale max(floor, sqrt(d_out/d_in)); rows=d_out, cols=d_in.
+
+    floor=1.0 -> Keller Jordan; floor=0.0 -> MuP; floor=tau -> KJ/MuP interpolation.
+    """
     shape_2d = (param.shape[0], param[0].numel()) if param.ndim > 2 else tuple(param.shape)
-    return max(1, shape_2d[0] / shape_2d[1]) ** 0.5
+    return max(floor, (shape_2d[0] / shape_2d[1]) ** 0.5)
+
+
+def _spectral_floor(adjust_lr: str, tau: float) -> float:
+    """Lower clamp for spectral aspect-ratio scaling, selected by mode."""
+    if adjust_lr == "mup":
+        return 0.0
+    if adjust_lr == "interp":
+        return tau
+    return 1.0  # "original" (KJ)
 
 
 class Muon(Optimizer):
@@ -86,10 +98,19 @@ class Muon(Optimizer):
         gns_restart_after: Re-materialize rectangular product after this many Gram
             NS iterations to prevent half-precision divergence. ``None`` disables.
             Default 2 (tuned for Polar Express). Ignored when ``gram_ns=False``.
-        adjust_lr: LR scaling mode. ``"original"`` applies KJ aspect-ratio scaling
-            ``sqrt(max(1, rows/cols))``. ``"match_rms_adamw"`` applies Moonshot's
-            per-parameter scaling ``0.2 * sqrt(max(rows, cols))``.
-            ``"none"`` applies no scaling (manual LR tuning).
+        adjust_lr: LR scaling mode.
+            ``"original"`` — KJ aspect-ratio scaling ``max(1, sqrt(d_out/d_in))``.
+            ``"mup"`` — MuP scaling ``sqrt(d_out/d_in)`` (no truncation; differs from
+            ``"original"`` only on fan-in layers, ``d_out < d_in``).
+            ``"interp"`` — ``max(tau, sqrt(d_out/d_in))``; ``tau=1`` reproduces
+            ``"original"``, ``tau=0`` reproduces ``"mup"``. Decay ``tau`` 1->0 across
+            training to transition KJ -> MuP.
+            ``"match_rms_adamw"`` — Moonshot per-parameter scaling
+            ``0.2 * sqrt(max(d_out, d_in))``.
+            ``"none"`` — no scaling (manual LR tuning).
+        tau: Interpolation clamp for ``adjust_lr="interp"``; ignored otherwise. Read
+            per group at step time, so a scheduler may mutate ``group["tau"]`` each
+            step. Expected range [0, 1].
         momentum_type: Momentum convention. ``"ema"`` uses ``m = beta*m + (1-beta)*g``
             (dominant convention). ``"classical"`` uses ``m = beta*m + g``.
         momentum_dtype: Dtype for momentum buffers. ``None`` inherits param dtype
@@ -136,6 +157,7 @@ class Muon(Optimizer):
         gram_ns: bool = True,
         gns_restart_after: int | None = GNS_RESTART_AFTER_DEFAULT,
         adjust_lr: AdjustLrMode = "original",
+        tau: float = 1.0,
         momentum_type: MomentumType = "ema",
         momentum_dtype: torch.dtype | None = None,
         foreach: bool = True,
@@ -161,8 +183,10 @@ class Muon(Optimizer):
             raise ValueError(f"Invalid weight_decay: {weight_decay}")
         if ns_steps < 1:
             raise ValueError(f"Invalid ns_steps: {ns_steps}")
-        if adjust_lr not in ("original", "match_rms_adamw", "none"):
+        if adjust_lr not in ("original", "match_rms_adamw", "none", "mup", "interp"):
             raise ValueError(f"Invalid adjust_lr: {adjust_lr!r}")
+        if not 0.0 <= tau <= 1.0:
+            raise ValueError(f"Invalid tau: {tau} (expected 0.0 <= tau <= 1.0)")
         if momentum_type not in ("ema", "classical"):
             raise ValueError(f"Invalid momentum_type: {momentum_type!r}")
         if mars_gamma <= 0.0:
@@ -208,6 +232,7 @@ class Muon(Optimizer):
             "gram_ns": gram_ns,
             "gns_restart_after": gns_restart_after,
             "adjust_lr": adjust_lr,
+            "tau": tau,
             "momentum_type": momentum_type,
             "momentum_dtype": momentum_dtype,
             "foreach": foreach,
@@ -418,13 +443,14 @@ class Muon(Optimizer):
                 u_2d = apply_normuon_rescale(u_2d, normuon_bufs[i], group["normuon_beta2"], red_dim)
                 updates[i] = u_2d.reshape(u.shape)
 
-        # --- Aspect-ratio scaling for "original" mode ---
+        # --- Aspect-ratio scaling (KJ / MuP / interp) ---
         adjust_lr = group["adjust_lr"]
-        if adjust_lr == "original":
+        if adjust_lr in ("original", "mup", "interp"):
+            floor = _spectral_floor(adjust_lr, group["tau"])
             for i, p in enumerate(params_with_grad):
-                ratio_scale = _aspect_ratio_scale(p)
-                if ratio_scale != 1.0:
-                    updates[i].mul_(ratio_scale)
+                scale = _spectral_scale(p, floor)
+                if scale != 1.0:
+                    updates[i].mul_(scale)
 
         # --- Cautious masking ---
         if group["cautious"]:
@@ -459,7 +485,7 @@ class Muon(Optimizer):
                 else:
                     for p, u in zip(params_with_grad, updates):
                         p.add_(u.reshape(p.shape), alpha=-lr)
-        elif use_foreach and adjust_lr in ("original", "none"):
+        elif use_foreach and adjust_lr in ("original", "none", "mup", "interp"):
             # Uniform LR -> single foreach call
             if wd > 0:
                 torch._foreach_mul_(params_with_grad, 1.0 - lr * wd)  # type: ignore[attr-defined]
@@ -585,11 +611,11 @@ class Muon(Optimizer):
                     u_2d = apply_normuon_rescale(u_2d, state["normuon_buffer"], group["normuon_beta2"], red_dim)
                     update = u_2d.reshape(update.shape)
 
-                # Aspect-ratio scaling for "original" mode
-                if adjust_lr == "original":
-                    ratio_scale = _aspect_ratio_scale(p)
-                    if ratio_scale != 1.0:
-                        update.mul_(ratio_scale)
+                # Aspect-ratio scaling (KJ / MuP / interp)
+                if adjust_lr in ("original", "mup", "interp"):
+                    scale = _spectral_scale(p, _spectral_floor(adjust_lr, group["tau"]))
+                    if scale != 1.0:
+                        update.mul_(scale)
 
                 # Cautious
                 if group["cautious"]:
